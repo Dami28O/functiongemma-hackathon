@@ -160,6 +160,12 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
+# Small on-device router model — used only for complexity routing, not function calling.
+# Recommended: Qwen2.5-0.5B-Instruct (GGUF, Q4_K_M ~300MB)
+# Download: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF
+# Place at: cactus/weights/router/qwen2.5-0.5b-instruct-q4_k_m.gguf
+router_model_path = "cactus/weights/router/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+
 import json, os, re, time
 import concurrent.futures
 from cactus import cactus_init, cactus_complete, cactus_destroy
@@ -254,6 +260,110 @@ def generate_cloud(messages, tools):
 
 ############## Hybrid routing helpers ##############
 
+# ── LLM Router ────────────────────────────────────────────────────────────────
+# A small on-device model (Qwen2.5-0.5B-Instruct) that analyses the user
+# request and the available tool descriptions to decide how many tools are
+# needed.  This replaces the fragile regex-based fast_path / is_complex logic
+# and generalises to unseen tools automatically.
+
+_router_handle = None
+
+
+def _get_router():
+    """Lazily load and cache the router model."""
+    global _router_handle
+    if _router_handle is None:
+        if not os.path.exists(router_model_path):
+            return None   # graceful degradation — fall back to regex heuristic
+        _router_handle = cactus_init(router_model_path)
+    return _router_handle
+
+
+_ROUTER_SYSTEM = (
+    "You are a routing assistant. Given a user request and a list of available "
+    "tools, output ONLY a JSON object with two fields:\n"
+    '  {"tools_needed": <integer>, "confidence": <float 0-1>}\n'
+    "tools_needed = the number of distinct tools required to fully satisfy the "
+    "request. confidence = how certain you are. No other text."
+)
+
+
+def llm_route(messages, tools):
+    """
+    Use the small on-device router model to estimate how many tools are needed.
+
+    Returns a dict:
+        {
+            "tools_needed": int,   # 1 = simple, 2+ = multi-tool / complex
+            "confidence": float,   # router's self-reported confidence
+            "router_time_ms": float,
+            "source": "llm-router" | "heuristic-fallback"
+        }
+    """
+    start = time.time()
+    router = _get_router()
+
+    if router is None:
+        # Router model not downloaded — fall back to simple heuristic
+        text = messages[-1]["content"].lower()
+        conjunctions = len(re.findall(r'\band\b|\balso\b|\bplus\b|\bthen\b', text))
+        action_verbs = len(re.findall(
+            r'\b(?:set|send|text|play|check|get|find|search|remind|create|wake|book|'
+            r'translate|open|add|turn|show|call)\b', text))
+        tools_needed = max(conjunctions + 1, action_verbs, 1)
+        return {
+            "tools_needed": tools_needed,
+            "confidence": 0.6,
+            "router_time_ms": (time.time() - start) * 1000,
+            "source": "heuristic-fallback",
+        }
+
+    # Build a compact tool list for the prompt
+    tool_summary = "\n".join(
+        f"- {t['name']}: {t.get('description', '')}"
+        for t in tools
+    )
+    user_text = messages[-1]["content"]
+    routing_prompt = (
+        f"Available tools:\n{tool_summary}\n\n"
+        f"User request: \"{user_text}\"\n\n"
+        "How many tools are needed? Reply with JSON only."
+    )
+
+    raw = cactus_complete(
+        router,
+        [
+            {"role": "system", "content": _ROUTER_SYSTEM},
+            {"role": "user",   "content": routing_prompt},
+        ],
+        max_tokens=32,
+        temperature=0,
+        stop_sequences=["\n", "<|im_end|>", "<end_of_turn>"],
+    )
+
+    router_time_ms = (time.time() - start) * 1000
+
+    try:
+        # Strip markdown fences if the model wraps output
+        cleaned = re.sub(r"```[a-z]*", "", raw).strip().strip("`")
+        parsed = json.loads(cleaned)
+        return {
+            "tools_needed": int(parsed.get("tools_needed", 1)),
+            "confidence":   float(parsed.get("confidence", 0.8)),
+            "router_time_ms": router_time_ms,
+            "source": "llm-router",
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # Parse failure — be conservative and treat as complex
+        return {
+            "tools_needed": 2,
+            "confidence": 0.5,
+            "router_time_ms": router_time_ms,
+            "source": "llm-router",
+        }
+
+
+# ── Legacy regex helpers (kept for reference / testing) ───────────────────────
 # Pronouns that are never valid contact/recipient names
 _PRONOUNS = {"him", "her", "them", "it", "me", "us", "you", "they", "he", "she"}
 
@@ -378,20 +488,15 @@ def _extract_calls(text, tool_map):
 
 def fast_path(messages, tools):
     """
-    Rule-based instant handler — covers easy, medium, and hard cases.
-    Extracts ALL tool calls from the message using regex patterns.
-    Returns a result dict (<1ms, tagged on-device) or None if unsure.
+    DEPRECATED — kept for backwards compatibility only.
+    generate_hybrid now uses llm_route() instead.
     """
     start_time = time.time()
-
     text = messages[-1]["content"]
     tool_map = {t["name"]: t for t in tools}
-
     calls = _extract_calls(text, tool_map)
     if not calls:
         return None
-
-    # Verify every extracted call has all required arguments
     for call in calls:
         tool = tool_map.get(call["name"])
         if not tool:
@@ -399,34 +504,13 @@ def fast_path(messages, tools):
         required = tool["parameters"].get("required", [])
         if any(req not in call["arguments"] for req in required):
             return None
-        
     total_time_ms = (time.time() - start_time) * 1000
-
     return {
         "function_calls": calls,
         "total_time_ms": total_time_ms,
         "confidence": 1.0,
         "source": "on-device",
     }
-
-
-def _count_implied_actions(text):
-    """Count distinct actions implied in the message via conjunctions + action verbs."""
-    conjunctions = re.findall(r'\band\b|\balso\b|\bplus\b|\bthen\b', text.lower())
-    action_verbs = re.findall(
-        r'\b(?:set|send|text|play|check|get|find|search|remind|create|wake)\b',
-        text.lower()
-    )
-    return max(len(conjunctions) + 1, len(action_verbs))
-
-
-def is_complex(messages, tools):
-    """
-    True when the request implies 2+ distinct actions.
-    Only triggers the parallel race — fast_path handles most multi-tool cases already.
-    """
-    text = messages[-1]["content"].lower()
-    return _count_implied_actions(text) >= 2
 
 
 def _parallel_race(messages, tools, confidence_threshold):
@@ -467,35 +551,46 @@ def _parallel_race(messages, tools, confidence_threshold):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.75):
     """
-    3-tier hybrid routing strategy:
+    LLM-routed hybrid inference strategy.
 
-    1. Fast path  — regex-based instant answer. Covers easy, medium AND hard
-                    multi-tool cases. <1ms, 100% on-device.
-    2. Complex    — parallel race: local + cloud fire simultaneously.
-                    Return local immediately if confident; else use cloud.
-                    Wall time ≈ max(local, cloud), not sum.
-    3. Simple     — local-first with tuned confidence threshold.
-                    Cloud fallback only when local is uncertain.
+    Tier 0 — LLM Router (Qwen2.5-0.5B on-device):
+              Analyses the request and available tools to determine how many
+              tools are needed.  Falls back to a regex heuristic if the router
+              model is not present.
+
+    Tier 1 — Simple (tools_needed == 1, router confident):
+              Run only Cactus/FunctionGemma locally.
+              Cloud fallback if local confidence is below threshold.
+
+    Tier 2 — Complex (tools_needed >= 2):
+              Parallel race: local + cloud fire simultaneously.
+              Local wins if confident AND returns enough calls; else cloud.
     """
-    # Tier 1: instant rule-based answer
-    result = fast_path(messages, tools)
-    if result is not None:
+    route = llm_route(messages, tools)
+    tools_needed  = route["tools_needed"]
+    router_conf   = route["confidence"]
+    router_time   = route["router_time_ms"]
+
+    if tools_needed >= 2 or router_conf < 0.65:
+        # Complex / uncertain — parallel race
+        result = _parallel_race(messages, tools, confidence_threshold)
+        result["total_time_ms"] += router_time
+        result["router"] = route["source"]
         return result
 
-    # Tier 2: multi-action → parallel race
-    if is_complex(messages, tools):
-        return _parallel_race(messages, tools, confidence_threshold)
-
-    # Tier 3: single-action → local first, cloud fallback
+    # Simple single-tool — local first, cloud fallback
     local = generate_cactus(messages, tools)
+    local["total_time_ms"] += router_time
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
+        local["router"] = route["source"]
         return local
 
     cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
     cloud["total_time_ms"] += local["total_time_ms"]
+    cloud["router"] = route["source"]
     return cloud
 
 
