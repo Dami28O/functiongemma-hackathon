@@ -116,56 +116,11 @@ def generate_cloud(messages, tools):
     if not api_key:
         return {"error": "Missing GEMINI_API_KEY", "function_calls": [], "total_time_ms": 1.0}
 
-<<<<<<< HEAD
-    gemini_tools = [
-        types.Tool(function_declarations=[
-            types.FunctionDeclaration(
-                name=t["name"],
-                description=t["description"],
-                parameters=types.Schema(
-                    type="OBJECT",
-                    properties={
-                        k: types.Schema(type=v["type"].upper(), description=v.get("description", ""))
-                        for k, v in t["parameters"]["properties"].items()
-                    },
-                    required=t["parameters"].get("required", []),
-                ),
-            )
-            for t in tools
-        ])
-    ]
-
-    contents = [m["content"] for m in messages if m["role"] == "user"]
-
-    start_time = time.time()
-
-    gemini_response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(tools=gemini_tools),
-    )
-
-    total_time_ms = (time.time() - start_time) * 1000
-
-    function_calls = []
-    for candidate in gemini_response.candidates:
-        for part in candidate.content.parts:
-            if part.function_call:
-                function_calls.append({
-                    "name": part.function_call.name,
-                    "arguments": dict(part.function_call.args),
-                })
-
-    return {
-        "function_calls": function_calls,
-        "total_time_ms": total_time_ms,
-=======
     text = messages[-1]["content"] if messages else ""
     t0 = time.time()
     payload = {
         "contents": [{"parts": [{"text": text}]}],
         "tools": [{"function_declarations": tools}]
->>>>>>> b813bbd (Optimize hybrid routing and standalone culinary agent)
     }
 
     try:
