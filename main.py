@@ -3,41 +3,67 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
+import atexit
 import json, os, re, time
 import concurrent.futures
-from cactus import cactus_init, cactus_complete, cactus_destroy
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
 
 
+############## Model cache — load once, reuse across all calls ##############
+
+_model_handle = None
+
+def _get_model():
+    """
+    Return a cached Cactus model handle, loading it on first call.
+    Reusing the same handle across benchmark cases avoids the 100-300ms
+    cactus_init overhead on every single inference call.
+    """
+    global _model_handle
+    if _model_handle is None:
+        _model_handle = cactus_init(functiongemma_path)
+        atexit.register(_cleanup_model)
+    return _model_handle
+
+def _cleanup_model():
+    global _model_handle
+    if _model_handle is not None:
+        cactus_destroy(_model_handle)
+        _model_handle = None
+
+
+############## Inference functions ##############
+
+_SYSTEM_PROMPT = (
+    "You are a precise function-calling assistant. "
+    "Your only job is to call the correct function with exact argument values "
+    "extracted from the user's request. Always call a function — never reply with plain text."
+)
+
+
 def generate_cactus(messages, tools):
     """Run function calling on-device via FunctionGemma + Cactus."""
-    model = cactus_init(functiongemma_path)
+    model = _get_model()
+    cactus_reset(model)   # clear KV cache from previous call
 
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
 
     raw_str = cactus_complete(
         model,
-        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        [{"role": "system", "content": _SYSTEM_PROMPT}] + messages,
         tools=cactus_tools,
         force_tools=True,
+        temperature=0,        # deterministic — best for structured output
         max_tokens=256,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
-    cactus_destroy(model)
-
     try:
         raw = json.loads(raw_str)
     except json.JSONDecodeError:
-        return {
-            "function_calls": [],
-            "total_time_ms": 0,
-            "confidence": 0,
-        }
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
     return {
         "function_calls": raw.get("function_calls", []),
@@ -306,13 +332,48 @@ def _parallel_race(messages, tools, confidence_threshold):
     return cloud
 
 
+def _generate_cactus_focused(messages, tools):
+    """
+    Like generate_cactus but with tool_rag_top_k=1 — tells FunctionGemma
+    to focus on the single most relevant tool. Faster and more accurate
+    for simple single-action requests where we already know the structure.
+    """
+    model = _get_model()
+    cactus_reset(model)
+
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
+
+    raw_str = cactus_complete(
+        model,
+        [{"role": "system", "content": _SYSTEM_PROMPT}] + messages,
+        tools=cactus_tools,
+        force_tools=True,
+        temperature=0,
+        max_tokens=128,          # shorter output for simple single-tool calls
+        tool_rag_top_k=1,        # pre-filter to the most relevant tool
+        stop_sequences=["<|im_end|>", "<end_of_turn>"],
+    )
+
+    try:
+        raw = json.loads(raw_str)
+    except json.JSONDecodeError:
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+
+    return {
+        "function_calls": raw.get("function_calls", []),
+        "total_time_ms": raw.get("total_time_ms", 0),
+        "confidence": raw.get("confidence", 0),
+    }
+
+
 def generate_hybrid(messages, tools, confidence_threshold=0.75):
     """
     3-tier hybrid routing strategy. All results come from real model inference.
 
     Tier 1 — Pattern-confident (simple, well-understood request):
-              fast_path() recognises the structure → trust local model fully,
-              skip parallel race overhead. Uses generate_cactus directly.
+              fast_path() recognises the structure unambiguously.
+              Uses focused local inference (tool_rag_top_k=1, max_tokens=128).
+              No parallel race overhead — local model is trusted directly.
 
     Tier 2 — Complex (multi-action request):
               Parallel race: local + cloud fire simultaneously.
@@ -320,16 +381,16 @@ def generate_hybrid(messages, tools, confidence_threshold=0.75):
               Wall time ≈ max(local, cloud), not their sum.
 
     Tier 3 — Ambiguous (unrecognised structure):
-              Local-first with tuned confidence threshold.
+              Local-first with confidence threshold.
               Cloud fallback only when local model is uncertain.
     """
-    # Tier 1: pattern-confident → route straight to local, no race needed
+    # Tier 1: pattern-confident → focused local inference, skip race overhead
     if fast_path(messages, tools):
-        local = generate_cactus(messages, tools)
+        local = _generate_cactus_focused(messages, tools)
         if local.get("function_calls"):
             local["source"] = "on-device"
             return local
-        # Local model unexpectedly failed — fall through to cloud
+        # Local model unexpectedly failed — immediate cloud fallback
         cloud = generate_cloud(messages, tools)
         cloud["source"] = "cloud (fallback)"
         cloud["total_time_ms"] += local["total_time_ms"]
@@ -339,7 +400,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.75):
     if is_complex(messages, tools):
         return _parallel_race(messages, tools, confidence_threshold)
 
-    # Tier 3: ambiguous single-action → local first, cloud fallback
+    # Tier 3: ambiguous → local first, cloud fallback
     local = generate_cactus(messages, tools)
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
