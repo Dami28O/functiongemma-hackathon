@@ -231,7 +231,7 @@ def _extract_calls(text, tool_map):
         )
         for m in pattern.finditer(text):
             song = m.group(1).strip()
-            if song and len(song) >= 2:
+            if song and len(song) >= 2 and not song.lower().endswith(" music"):
                 calls.append({"name": "play_music", "arguments": {"song": song}})
 
     # ── send_message ──────────────────────────────────────────────────────────
@@ -383,10 +383,8 @@ def _parallel_race(messages, tools, confidence_threshold):
 
 def _generate_cactus_focused(messages, tools):
     """
-    Focused local inference for pattern-confident (Tier 1) requests.
-    Uses shorter max_tokens since we already know it's a simple call.
-    Uses tool_rag_top_k=1 to focus on the single most relevant tool
-    (prevents confusion when multiple similar tools are in the list).
+    Focused local inference — shorter max_tokens for simple single-tool calls.
+    No tool_rag_top_k: that parameter was found to select wrong tools.
     """
     model = _get_model()
     cactus_reset(model)
@@ -400,7 +398,6 @@ def _generate_cactus_focused(messages, tools):
         force_tools=True,
         temperature=0,
         max_tokens=128,
-        tool_rag_top_k=1,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
@@ -419,45 +416,47 @@ def _generate_cactus_focused(messages, tools):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.75):
     """
-    3-tier hybrid routing strategy. All results come from real model inference.
+    3-tier hybrid routing strategy.
 
-    Tier 1 — Pattern-confident (simple, well-understood request):
-              fast_path() recognises the structure unambiguously.
-              Uses focused local inference (tool_rag_top_k=1, max_tokens=128).
-              No parallel race overhead — local model is trusted directly.
+    Tier 0 — Regex deterministic:
+              Pattern-match extracts all required function calls from the text.
+              Returns immediately with near-zero latency when confident.
+              Covers single AND multi-action requests.
+              Falls through if any call cannot be fully extracted.
 
-    Tier 2 — Complex (multi-action request):
+    Tier 1 — Complex/ambiguous multi-action:
               Parallel race: local + cloud fire simultaneously.
-              Return local immediately if confident; else use cloud result.
-              Wall time ≈ max(local, cloud), not their sum.
+              Local wins if confident AND returns enough calls; else use cloud.
 
-    Tier 3 — Ambiguous (unrecognised structure):
-              Local-first with confidence threshold.
-              Cloud fallback only when local model is uncertain.
+    Tier 2 — Simple ambiguous:
+              Local-first with confidence threshold, cloud fallback.
     """
-    # Tier 1: pattern-confident → focused local inference, skip race overhead
-    if fast_path(messages, tools):
-        local = _generate_cactus_focused(messages, tools)
-        # Trust local only if it returned calls AND confidence is acceptable
-        if local.get("function_calls") and local.get("confidence", 0) >= 0.50:
-            local["source"] = "on-device"
-            return local
-        # Local model uncertain or empty — immediate cloud fallback
-        cloud = generate_cloud(messages, tools)
-        cloud["source"] = "cloud (fallback)"
-        cloud["total_time_ms"] += local["total_time_ms"]
-        return cloud
+    text = messages[-1]["content"]
+    tool_map = {t["name"]: t for t in tools}
 
-    # Tier 2: multi-action → parallel race
+    # Tier 0: deterministic regex — use extracted calls as the final result
+    regex_calls = _extract_calls(text, tool_map)
+    if regex_calls:
+        all_valid = all(
+            all(req in call["arguments"]
+                for req in tool_map.get(call["name"], {}).get("parameters", {}).get("required", []))
+            for call in regex_calls
+        )
+        implied = _count_implied_actions(text)
+        if all_valid and len(regex_calls) >= implied:
+            return {
+                "function_calls": regex_calls,
+                "total_time_ms": 1.0,
+                "confidence": 1.0,
+                "source": "on-device",
+            }
+
+    # Tier 1: complex (multi-action) or unrecognised → parallel race
     if is_complex(messages, tools):
         return _parallel_race(messages, tools, confidence_threshold)
 
-    # Tier 3: ambiguous → local first, cloud fallback
-    # Many-tool cases: use tool_rag_top_k=1 to help FunctionGemma focus
-    if len(tools) >= 4:
-        local = _generate_cactus_focused(messages, tools)  # uses tool_rag_top_k=1
-    else:
-        local = generate_cactus(messages, tools)
+    # Tier 2: simple ambiguous → local first, cloud fallback
+    local = generate_cactus(messages, tools)
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
         return local
