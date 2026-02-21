@@ -1,10 +1,10 @@
 
 import sys, os
-sys.path.insert(0, "../cactus/python/src")
+sys.path.insert(0, "cactus/python/src")
 os.environ["CACTUS_NO_CLOUD_TELE"] = "1"
 
 import json
-from main import generate_cactus
+from main import generate_hybrid
 
 
 ############## Tool definitions ##############
@@ -353,8 +353,6 @@ BENCHMARKS = [
 
 def _normalize(v):
     """Normalize a value for comparison."""
-    if isinstance(v, (int, float)):
-        v = str(v)
     if isinstance(v, str):
         return v.strip().lower()
     return v
@@ -380,8 +378,6 @@ def compute_f1(predicted_calls, expected_calls):
         return 1.0
     if not predicted_calls or not expected_calls:
         return 0.0
-        
-    is_timer = any(e.get("name") == "set_timer" for e in expected_calls)
 
     matched = 0
     used = set()
@@ -395,16 +391,8 @@ def compute_f1(predicted_calls, expected_calls):
     precision = matched / len(predicted_calls)
     recall = matched / len(expected_calls)
     if precision + recall == 0:
-        f1 = 0.0
-    else:
-        f1 = 2 * precision * recall / (precision + recall)
-        
-    if is_timer:
-        print(f"\n[DEBUG f1] Pred: {predicted_calls}")
-        print(f"[DEBUG f1] Exp: {expected_calls}")
-        print(f"[DEBUG f1] F1 val: {f1}")
-        
-    return f1
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
 
 
 def run_benchmark(benchmarks=None):
@@ -416,8 +404,7 @@ def run_benchmark(benchmarks=None):
     results = []
     for i, case in enumerate(benchmarks, 1):
         print(f"[{i}/{total}] Running: {case['name']} ({case['difficulty']})...", end=" ", flush=True)
-        result = generate_cactus(case["messages"], case["tools"])
-        result["source"] = "on-device"
+        result = generate_hybrid(case["messages"], case["tools"])
         f1 = compute_f1(result["function_calls"], case["expected_calls"])
         source = result.get("source", "unknown")
         print(f"F1={f1:.2f} | {result['total_time_ms']:.0f}ms | {source}")
