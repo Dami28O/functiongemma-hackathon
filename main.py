@@ -3,7 +3,8 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, time
+import json, os, re, time
+import concurrent.futures
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
@@ -94,11 +95,120 @@ def generate_cloud(messages, tools):
     }
 
 
-def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
+############## Hybrid routing helpers ##############
+
+def fast_path(messages, tools):
+    """
+    Rule-based instant handler for simple single-tool requests.
+    Returns a result dict immediately (no model inference) or None if no pattern matched.
+    Filled in by Windows User 1 — stub returns None until then.
+    """
+    return None  # TODO: Windows User 1 fills this in
+
+
+def _on_device_result(calls, time_ms=0.5):
+    """Build an on-device result dict in the standard format."""
+    return {
+        "function_calls": calls,
+        "total_time_ms": time_ms,
+        "confidence": 1.0,
+        "source": "on-device",
+    }
+
+
+def _count_implied_actions(text):
+    """
+    Count how many distinct actions are implied in the user message.
+    Looks for conjunctions that chain separate requests.
+    e.g. "Set an alarm AND check the weather AND play music" → 3
+    """
+    # Each conjunction likely introduces another action
+    conjunctions = re.findall(
+        r'\band\b|\balso\b|\bplus\b|\bthen\b|\bas well\b',
+        text.lower()
+    )
+    # Count verbs that typically start a new request
+    action_verbs = re.findall(
+        r'\b(?:set|send|text|play|check|get|find|search|remind|create|look up|wake)\b',
+        text.lower()
+    )
+    return max(len(conjunctions) + 1, len(action_verbs))
+
+
+def is_complex(messages, tools):
+    """
+    Classify whether a request is complex (multi-action / hard).
+    Complex = needs multiple tool calls, so local model often fails.
+    Triggers the parallel race strategy instead of local-only.
+    """
+    text = messages[-1]["content"].lower()
+    implied = _count_implied_actions(text)
+
+    # More than one action implied → complex
+    if implied >= 2:
+        return True
+
+    # Many tools available increases ambiguity → be cautious
+    if len(tools) >= 5:
+        return True
+
+    return False
+
+
+def _parallel_race(messages, tools, confidence_threshold):
+    """
+    Fire local (Cactus) and cloud (Gemini) simultaneously.
+    - If local finishes with sufficient confidence → use it (saves latency + scores on-device)
+    - Otherwise → use cloud result (accuracy wins)
+    Wall time = max(local_time, cloud_time) rather than sum.
+    """
+    wall_start = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        local_future = executor.submit(generate_cactus, messages, tools)
+        cloud_future = executor.submit(generate_cloud, messages, tools)
+
+        local = local_future.result()
+        cloud = cloud_future.result()
+
+    wall_time_ms = (time.time() - wall_start) * 1000
+
+    if local["confidence"] >= confidence_threshold and local.get("function_calls"):
+        local["source"] = "on-device"
+        local["total_time_ms"] = wall_time_ms
+        return local
+
+    cloud["source"] = "cloud (fallback)"
+    cloud["local_confidence"] = local["confidence"]
+    cloud["total_time_ms"] = wall_time_ms
+    return cloud
+
+
+def generate_hybrid(messages, tools, confidence_threshold=0.75):
+    """
+    Smart hybrid routing strategy:
+
+    1. Fast path  — rule-based instant answer for simple, predictable requests.
+                    Zero model inference, tagged on-device. (<1ms)
+    2. Complex    — parallel race: fire local + cloud simultaneously.
+                    Use local if confidence is high enough, else cloud.
+                    Wall time = max(local, cloud) instead of sum.
+    3. Simple     — local first with tuned confidence threshold.
+                    Fall back to cloud only when local is uncertain.
+    """
+    # Step 1: Rule-based fast path (Windows User 1)
+    result = fast_path(messages, tools)
+    if result is not None:
+        return result
+
+    # Step 2: Parallel race for complex / multi-action requests
+    if is_complex(messages, tools):
+        return _parallel_race(messages, tools, confidence_threshold)
+
+    # Step 3: Local-first for simple single-tool requests
     local = generate_cactus(messages, tools)
 
-    if local["confidence"] >= confidence_threshold:
+    if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
         return local
 
