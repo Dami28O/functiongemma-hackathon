@@ -292,6 +292,13 @@ def fast_path(messages, tools):
     text = messages[-1]["content"]
     tool_map = {t["name"]: t for t in tools}
 
+    # Multi-action requests must go through the parallel race.
+    # fast_path only handles single-tool calls — _generate_cactus_focused
+    # uses max_tokens=128 which is insufficient for 2+ tool call responses.
+    # _count_implied_actions is defined below but resolved at call time (Python late-binding).
+    if _count_implied_actions(text) >= 2:
+        return False
+
     calls = _extract_calls(text, tool_map)
     if not calls:
         return False
