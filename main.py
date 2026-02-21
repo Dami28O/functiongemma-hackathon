@@ -221,32 +221,34 @@ def _extract_calls(text, tool_map):
 
 def fast_path(messages, tools):
     """
-    Rule-based instant handler — covers easy, medium, and hard cases.
-    Extracts ALL tool calls from the message using regex patterns.
-    Returns a result dict (<1ms, tagged on-device) or None if unsure.
+    Pattern-based pre-classifier: determines whether a request is
+    unambiguously simple enough to route straight to generate_cactus
+    with high confidence, skipping the parallel race overhead.
+
+    Returns True  → caller should use generate_cactus (simple, well-understood)
+    Returns False → caller should use full routing (complex or ambiguous)
+
+    This is a ROUTING hint, NOT a result generator. The actual function
+    calls always come from the model (Cactus or Gemini), never from regex.
     """
     text = messages[-1]["content"]
     tool_map = {t["name"]: t for t in tools}
 
     calls = _extract_calls(text, tool_map)
     if not calls:
-        return None
+        return False
 
-    # Verify every extracted call has all required arguments
+    # Every extracted call must have all required arguments clearly present
     for call in calls:
         tool = tool_map.get(call["name"])
         if not tool:
-            return None
+            return False
         required = tool["parameters"].get("required", [])
         if any(req not in call["arguments"] for req in required):
-            return None
+            return False
 
-    return {
-        "function_calls": calls,
-        "total_time_ms": 0.5,
-        "confidence": 1.0,
-        "source": "on-device",
-    }
+    # Pattern matched cleanly — safe to route straight to local model
+    return True
 
 
 def _count_implied_actions(text):
@@ -306,26 +308,38 @@ def _parallel_race(messages, tools, confidence_threshold):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.75):
     """
-    3-tier hybrid routing strategy:
+    3-tier hybrid routing strategy. All results come from real model inference.
 
-    1. Fast path  — regex-based instant answer. Covers easy, medium AND hard
-                    multi-tool cases. <1ms, 100% on-device.
-    2. Complex    — parallel race: local + cloud fire simultaneously.
-                    Return local immediately if confident; else use cloud.
-                    Wall time ≈ max(local, cloud), not sum.
-    3. Simple     — local-first with tuned confidence threshold.
-                    Cloud fallback only when local is uncertain.
+    Tier 1 — Pattern-confident (simple, well-understood request):
+              fast_path() recognises the structure → trust local model fully,
+              skip parallel race overhead. Uses generate_cactus directly.
+
+    Tier 2 — Complex (multi-action request):
+              Parallel race: local + cloud fire simultaneously.
+              Return local immediately if confident; else use cloud result.
+              Wall time ≈ max(local, cloud), not their sum.
+
+    Tier 3 — Ambiguous (unrecognised structure):
+              Local-first with tuned confidence threshold.
+              Cloud fallback only when local model is uncertain.
     """
-    # Tier 1: instant rule-based answer
-    result = fast_path(messages, tools)
-    if result is not None:
-        return result
+    # Tier 1: pattern-confident → route straight to local, no race needed
+    if fast_path(messages, tools):
+        local = generate_cactus(messages, tools)
+        if local.get("function_calls"):
+            local["source"] = "on-device"
+            return local
+        # Local model unexpectedly failed — fall through to cloud
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fallback)"
+        cloud["total_time_ms"] += local["total_time_ms"]
+        return cloud
 
     # Tier 2: multi-action → parallel race
     if is_complex(messages, tools):
         return _parallel_race(messages, tools, confidence_threshold)
 
-    # Tier 3: single-action → local first, cloud fallback
+    # Tier 3: ambiguous single-action → local first, cloud fallback
     local = generate_cactus(messages, tools)
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
