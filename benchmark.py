@@ -4,7 +4,7 @@ sys.path.insert(0, "../cactus/python/src")
 os.environ["CACTUS_NO_CLOUD_TELE"] = "1"
 
 import json
-from main import generate_cactus
+from main import generate_hybrid
 
 
 ############## Tool definitions ##############
@@ -416,8 +416,7 @@ def run_benchmark(benchmarks=None):
     results = []
     for i, case in enumerate(benchmarks, 1):
         print(f"[{i}/{total}] Running: {case['name']} ({case['difficulty']})...", end=" ", flush=True)
-        result = generate_cactus(case["messages"], case["tools"])
-        result["source"] = "on-device"
+        result = generate_hybrid(case["messages"], case["tools"])
         f1 = compute_f1(result["function_calls"], case["expected_calls"])
         source = result.get("source", "unknown")
         print(f"F1={f1:.2f} | {result['total_time_ms']:.0f}ms | {source}")

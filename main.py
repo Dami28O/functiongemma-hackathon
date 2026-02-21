@@ -8,48 +8,106 @@ from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
 
+# Singleton Model: Initialize once at the top level to avoid reload latency
+CACTUS_MODEL = cactus_init(functiongemma_path)
 
-def generate_cactus(messages, tools):
-    """Run function calling on-device via FunctionGemma + Cactus."""
-    model = cactus_init(functiongemma_path)
+def generate_cactus(messages, tools, use_reasoning=True):
+    """V11: Optimized for accuracy with hardened parsing."""
+    
+    # 1. Reasoning Injection: Add thought_process to tool schema
+    actual_tools = []
+    if use_reasoning:
+        for t in tools:
+            t_copy = json.loads(json.dumps(t))
+            t_copy["parameters"]["properties"]["thought_process"] = {
+                "type": "string",
+                "description": "Short logic: 1. Intent. 2. Tool choice. 3. Param logic."
+            }
+            if "required" not in t_copy["parameters"]:
+                t_copy["parameters"]["required"] = []
+            if "thought_process" not in t_copy["parameters"]["required"]:
+                t_copy["parameters"]["required"].insert(0, "thought_process")
+            actual_tools.append(t_copy)
+    else:
+        actual_tools = tools
 
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
+    cactus_tools = [{"type": "function", "function": t} for t in actual_tools]
+
+    # V14: Minified rules for 270m performance
+    sys_content = (
+        "You are a tool caller. Output exactly one JSON object with 'function_calls'.\n"
+        "RULES: Integers=digits. Times=H:MM AM/PM. No talk."
+    )
+    if use_reasoning:
+        sys_content = "Think then JSON. Rules: Integers=digits. Times=H:MM AM/PM. No talk."
 
     raw_str = cactus_complete(
-        model,
-        [{"role": "system", "content": "You are a precise tool-calling assistant. Follow these absolute rules:\n"
-                                     "1. You have access to several tools. If a tool matches the user's request, you MUST call it.\n"
-                                     "2. Extract argument values EXACTLY as they appear in the user's request.\n"
-                                     "3. DO NOT hallucinate, guess, or calculate values. If the user says '10 minutes', extract 10.\n"
-                                     "4. DO NOT make up titles or messages unless told to. Strip conversational filler (e.g. use 'meeting', not 'Reminder about the meeting').\n"
-                                     "5. If a time is given like '3:00 PM', use that exact string.\n"
-                                     "6. Only use the tools provided."}] + messages,
+        CACTUS_MODEL,
+        [{"role": "system", "content": sys_content}] + messages,
         tools=cactus_tools,
         force_tools=True,
-        max_tokens=256,
+        max_tokens=400 if use_reasoning else 128,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
         temperature=0.0,
     )
 
-    cactus_reset(model)
-    cactus_destroy(model)
-
     try:
-        raw = json.loads(raw_str)
-    except json.JSONDecodeError:
-        return {
-            "function_calls": [],
-            "total_time_ms": 0,
-            "confidence": 0,
-        }
+        # Robust JSON extraction without re: Find the first { and last }
+        start_idx = raw_str.find("{")
+        end_idx = raw_str.rfind("}")
+        if start_idx != -1 and end_idx != -1:
+            clean_json = raw_str[start_idx:end_idx+1]
+            raw = json.loads(clean_json)
+        else:
+            raw = json.loads(raw_str)
+            
+        function_calls = raw.get("function_calls", [])
+
+        # 1. Type Casting & Cleanup (No Regex)
+        for call in function_calls:
+            tool_def = next((t for t in tools if t["name"] == call["name"]), None)
+            if tool_def:
+                props = tool_def.get("parameters", {}).get("properties", {})
+                args = call.get("arguments", {})
+                for p_name, p_schema in props.items():
+                    if p_name in args:
+                        p_type = p_schema.get("type", "").lower()
+                        val = str(args[p_name])
+                        try:
+                            if p_type == "integer":
+                                # V14: Stop at first non-digit (Fixes "10:00" -> "1000" bug)
+                                digits = []
+                                for i, c in enumerate(val):
+                                    if c.isdigit(): digits.append(c)
+                                    elif digits: break # Stop once we have digits and hit a separator
+                                    elif c == "-" and i == 0: digits.append(c)
+                                res = "".join(digits)
+                                args[p_name] = int(res) if res else 0
+                            elif p_type == "number":
+                                seen_dot = False
+                                digits = []
+                                for i, c in enumerate(val):
+                                    if c.isdigit(): digits.append(c)
+                                    elif c == "." and not seen_dot:
+                                        digits.append(c)
+                                        seen_dot = True
+                                    elif digits: break
+                                    elif c == "-" and i == 0: digits.append(c)
+                                res = "".join(digits)
+                                args[p_name] = float(res) if res else 0.0
+                        except: pass
+            
+            # Remove reasoning metadata from final output
+            if "thought_process" in call.get("arguments", {}):
+                del call["arguments"]["thought_process"]
+
+    except Exception:
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
     return {
-        "function_calls": raw.get("function_calls", []),
-        "total_time_ms": raw.get("total_time_ms", 0),
-        "confidence": raw.get("confidence", 0),
+        "function_calls": function_calls,
+        "total_time_ms": raw.get("total_time_ms", 0) if "raw" in locals() and isinstance(raw, dict) else 0,
+        "confidence": raw.get("confidence", 0) if "raw" in locals() and isinstance(raw, dict) else 0,
     }
 
 
@@ -102,18 +160,43 @@ def generate_cloud(messages, tools):
     }
 
 
-def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
-    local = generate_cactus(messages, tools)
+def calculate_complexity_score(messages, tools):
+    """Predict complexity using structural cues (V10)."""
+    q = "".join(m["content"].lower() for m in messages if m["role"] == "user")
+    
+    # 1. Structural Cues - Very sensitive to multi-intent markers
+    has_multi = any(c in q for c in [" and ", " then ", ";", " also ", " plus "])
+    len_score = len(q.split()) / 12.0 # More sensitive to long queries
+    
+    # 2. Toolset Complexity
+    tool_score = len(tools) / 5.0
+    
+    return min((0.5 if has_multi else 0) + (len_score * 0.2) + (tool_score * 0.3), 1.0)
 
-    if local["confidence"] >= confidence_threshold:
+
+def generate_hybrid(messages, tools, confidence_threshold=0.90):
+    """V14 Hybrid Strategy: Balanced Locality & F1."""
+    complexity = calculate_complexity_score(messages, tools)
+    
+    # 1. Cloud Handoff (Threshold set to 0.45 for Locality-F1 balance)
+    if complexity > 0.45:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fast-handoff)"
+        return cloud
+
+    # 2. Local Model (Tiered Reasoning)
+    use_reasoning = complexity > 0.2 
+    local = generate_cactus(messages, tools, use_reasoning=use_reasoning)
+
+    if local["confidence"] >= 0.8:
         local["source"] = "on-device"
         return local
 
+    # Fallback
     cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"]
+    cloud["total_time_ms"] += local.get("total_time_ms", 0)
     return cloud
 
 
