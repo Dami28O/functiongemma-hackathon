@@ -72,7 +72,7 @@ def generate_cloud(messages, tools):
     start_time = time.time()
 
     gemini_response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         contents=contents,
         config=types.GenerateContentConfig(tools=gemini_tools),
     )
@@ -107,7 +107,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     cloud["local_confidence"] = local["confidence"]
     cloud["total_time_ms"] += local["total_time_ms"]
     return cloud
-
 
 def print_result(label, result):
     """Pretty-print a generation result."""
