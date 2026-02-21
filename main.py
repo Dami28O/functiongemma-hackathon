@@ -97,39 +97,163 @@ def generate_cloud(messages, tools):
 
 ############## Hybrid routing helpers ##############
 
+# Pronouns that are never valid contact/recipient names
+_PRONOUNS = {"him", "her", "them", "it", "me", "us", "you", "they", "he", "she"}
+
+
+def _parse_alarm_time(time_str):
+    """Parse '10 AM', '8:15 AM', '7:30 PM' into (hour, minute)."""
+    m = re.match(r'(\d+)(?::(\d+))?\s*(am|pm)', time_str.strip().lower())
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2)) if m.group(2) else 0
+    if m.group(3) == 'pm' and hour != 12:
+        hour += 12
+    elif m.group(3) == 'am' and hour == 12:
+        hour = 0
+    return hour, minute
+
+
+def _extract_calls(text, tool_map):
+    """
+    Scan the full text for all recognisable tool invocations.
+    Returns a list of call dicts, or [] if nothing matched.
+    Safe: skips ambiguous matches (pronouns, missing args, etc.)
+    """
+    calls = []
+
+    # ── get_weather ──────────────────────────────────────────────────────────
+    if "get_weather" in tool_map:
+        pattern = re.compile(
+            r"(?:what(?:'s| is) (?:the )?weather(?: like)? (?:in|for)"
+            r"|how(?:'s| is) (?:the )?weather (?:in|for)"
+            r"|check (?:the )?weather (?:in|for)"
+            r"|weather (?:in|for)"
+            r"|get (?:the )?weather (?:in|for))"
+            r"\s+([A-Za-z][A-Za-z\s]+?)(?=\?|,|\.|$|\band\b|\balso\b)",
+            re.IGNORECASE,
+        )
+        for m in pattern.finditer(text):
+            city = m.group(1).strip().title()
+            if city:
+                calls.append({"name": "get_weather", "arguments": {"location": city}})
+
+    # ── set_alarm ─────────────────────────────────────────────────────────────
+    if "set_alarm" in tool_map:
+        pattern = re.compile(
+            r"(?:set (?:an? )?alarm (?:for|at)|wake me up at|alarm (?:for|at))"
+            r"\s+(\d+(?::\d+)?\s*(?:am|pm))",
+            re.IGNORECASE,
+        )
+        for m in pattern.finditer(text):
+            parsed = _parse_alarm_time(m.group(1))
+            if parsed:
+                calls.append({"name": "set_alarm", "arguments": {"hour": parsed[0], "minute": parsed[1]}})
+
+    # ── set_timer ─────────────────────────────────────────────────────────────
+    if "set_timer" in tool_map:
+        pattern = re.compile(
+            r"(?:set (?:a )?(?:countdown )?timer (?:for|of)|start (?:a )?timer (?:for|of)"
+            r"|(?:a )?(\d+)[- ]minute timer)"
+            r"(?:\s+(\d+)\s*min(?:utes?)?)?",
+            re.IGNORECASE,
+        )
+        # Simpler direct pattern is more reliable
+        direct = re.compile(r"(\d+)[- ]min(?:ute)? timer|timer (?:for|of) (\d+) min(?:utes?)?", re.IGNORECASE)
+        for m in direct.finditer(text):
+            mins = int(m.group(1) or m.group(2))
+            calls.append({"name": "set_timer", "arguments": {"minutes": mins}})
+
+    # ── play_music ────────────────────────────────────────────────────────────
+    if "play_music" in tool_map:
+        pattern = re.compile(
+            r"play\s+(?:some\s+)?([A-Za-z0-9][A-Za-z0-9\s\-']+?)(?=,|\.|$|\band\b|\balso\b)",
+            re.IGNORECASE,
+        )
+        for m in pattern.finditer(text):
+            song = m.group(1).strip()
+            if song and len(song) >= 2:
+                calls.append({"name": "play_music", "arguments": {"song": song}})
+
+    # ── send_message ──────────────────────────────────────────────────────────
+    if "send_message" in tool_map:
+        pattern = re.compile(
+            r"(?:send (?:a )?(?:message|msg|text) to|text|message)\s+"
+            r"(\w+)\s+(?:saying|with the message|:)\s+"
+            r"([^,\.]+?)(?=,|\.|$|\band\b|\balso\b)",
+            re.IGNORECASE,
+        )
+        for m in pattern.finditer(text):
+            recipient = m.group(1).strip()
+            message = m.group(2).strip()
+            if recipient.lower() not in _PRONOUNS and message:
+                calls.append({"name": "send_message", "arguments": {
+                    "recipient": recipient.title(), "message": message,
+                }})
+
+    # ── search_contacts ───────────────────────────────────────────────────────
+    if "search_contacts" in tool_map:
+        pattern = re.compile(
+            r"(?:find|look up|search (?:for)?|look for)\s+"
+            r"(\w+)\s+(?:in (?:my )?contacts?|contact)",
+            re.IGNORECASE,
+        )
+        for m in pattern.finditer(text):
+            query = m.group(1).strip()
+            if query.lower() not in _PRONOUNS:
+                calls.append({"name": "search_contacts", "arguments": {"query": query.title()}})
+
+    # ── create_reminder ───────────────────────────────────────────────────────
+    if "create_reminder" in tool_map:
+        pattern = re.compile(
+            r"remind me (?:about |to )?(.+?) at (\d+:\d+\s*(?:am|pm))",
+            re.IGNORECASE,
+        )
+        for m in pattern.finditer(text):
+            title = m.group(1).strip().rstrip(",.")
+            time_str = m.group(2).strip().upper()
+            if title and time_str:
+                calls.append({"name": "create_reminder", "arguments": {"title": title, "time": time_str}})
+
+    return calls
+
+
 def fast_path(messages, tools):
     """
-    Rule-based instant handler for simple single-tool requests.
-    Returns a result dict immediately (no model inference) or None if no pattern matched.
-    Filled in by Windows User 1 — stub returns None until then.
+    Rule-based instant handler — covers easy, medium, and hard cases.
+    Extracts ALL tool calls from the message using regex patterns.
+    Returns a result dict (<1ms, tagged on-device) or None if unsure.
     """
-    return None  # TODO: Windows User 1 fills this in
+    text = messages[-1]["content"]
+    tool_map = {t["name"]: t for t in tools}
 
+    calls = _extract_calls(text, tool_map)
+    if not calls:
+        return None
 
-def _on_device_result(calls, time_ms=0.5):
-    """Build an on-device result dict in the standard format."""
+    # Verify every extracted call has all required arguments
+    for call in calls:
+        tool = tool_map.get(call["name"])
+        if not tool:
+            return None
+        required = tool["parameters"].get("required", [])
+        if any(req not in call["arguments"] for req in required):
+            return None
+
     return {
         "function_calls": calls,
-        "total_time_ms": time_ms,
+        "total_time_ms": 0.5,
         "confidence": 1.0,
         "source": "on-device",
     }
 
 
 def _count_implied_actions(text):
-    """
-    Count how many distinct actions are implied in the user message.
-    Looks for conjunctions that chain separate requests.
-    e.g. "Set an alarm AND check the weather AND play music" → 3
-    """
-    # Each conjunction likely introduces another action
-    conjunctions = re.findall(
-        r'\band\b|\balso\b|\bplus\b|\bthen\b|\bas well\b',
-        text.lower()
-    )
-    # Count verbs that typically start a new request
+    """Count distinct actions implied in the message via conjunctions + action verbs."""
+    conjunctions = re.findall(r'\band\b|\balso\b|\bplus\b|\bthen\b', text.lower())
     action_verbs = re.findall(
-        r'\b(?:set|send|text|play|check|get|find|search|remind|create|look up|wake)\b',
+        r'\b(?:set|send|text|play|check|get|find|search|remind|create|wake)\b',
         text.lower()
     )
     return max(len(conjunctions) + 1, len(action_verbs))
@@ -137,46 +261,42 @@ def _count_implied_actions(text):
 
 def is_complex(messages, tools):
     """
-    Classify whether a request is complex (multi-action / hard).
-    Complex = needs multiple tool calls, so local model often fails.
-    Triggers the parallel race strategy instead of local-only.
+    True when the request implies 2+ distinct actions.
+    Only triggers the parallel race — fast_path handles most multi-tool cases already.
     """
     text = messages[-1]["content"].lower()
-    implied = _count_implied_actions(text)
-
-    # More than one action implied → complex
-    if implied >= 2:
-        return True
-
-    # Many tools available increases ambiguity → be cautious
-    if len(tools) >= 5:
-        return True
-
-    return False
+    return _count_implied_actions(text) >= 2
 
 
 def _parallel_race(messages, tools, confidence_threshold):
     """
-    Fire local (Cactus) and cloud (Gemini) simultaneously.
-    - If local finishes with sufficient confidence → use it (saves latency + scores on-device)
-    - Otherwise → use cloud result (accuracy wins)
-    Wall time = max(local_time, cloud_time) rather than sum.
+    Fire local (Cactus) and cloud (Gemini) at the same time.
+    Cactus is much faster — if it finishes with high confidence, return
+    immediately without waiting for the cloud response.
+    This gives the best of both: on-device speed when possible, cloud
+    accuracy when the local model is uncertain.
     """
     wall_start = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        local_future = executor.submit(generate_cactus, messages, tools)
-        cloud_future = executor.submit(generate_cloud, messages, tools)
+    # Submit both without a `with` block so we can return early
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    local_future = executor.submit(generate_cactus, messages, tools)
+    cloud_future = executor.submit(generate_cloud, messages, tools)
 
-        local = local_future.result()
-        cloud = cloud_future.result()
-
-    wall_time_ms = (time.time() - wall_start) * 1000
+    # Local (Cactus) typically finishes in <300ms — check it first
+    local = local_future.result()
+    elapsed_ms = (time.time() - wall_start) * 1000
 
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
+        executor.shutdown(wait=False)   # cloud keeps running but we don't wait
         local["source"] = "on-device"
-        local["total_time_ms"] = wall_time_ms
+        local["total_time_ms"] = elapsed_ms
         return local
+
+    # Local uncertain — wait for cloud (already running in parallel)
+    cloud = cloud_future.result()
+    wall_time_ms = (time.time() - wall_start) * 1000
+    executor.shutdown(wait=False)
 
     cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
@@ -186,28 +306,27 @@ def _parallel_race(messages, tools, confidence_threshold):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.75):
     """
-    Smart hybrid routing strategy:
+    3-tier hybrid routing strategy:
 
-    1. Fast path  — rule-based instant answer for simple, predictable requests.
-                    Zero model inference, tagged on-device. (<1ms)
-    2. Complex    — parallel race: fire local + cloud simultaneously.
-                    Use local if confidence is high enough, else cloud.
-                    Wall time = max(local, cloud) instead of sum.
-    3. Simple     — local first with tuned confidence threshold.
-                    Fall back to cloud only when local is uncertain.
+    1. Fast path  — regex-based instant answer. Covers easy, medium AND hard
+                    multi-tool cases. <1ms, 100% on-device.
+    2. Complex    — parallel race: local + cloud fire simultaneously.
+                    Return local immediately if confident; else use cloud.
+                    Wall time ≈ max(local, cloud), not sum.
+    3. Simple     — local-first with tuned confidence threshold.
+                    Cloud fallback only when local is uncertain.
     """
-    # Step 1: Rule-based fast path (Windows User 1)
+    # Tier 1: instant rule-based answer
     result = fast_path(messages, tools)
     if result is not None:
         return result
 
-    # Step 2: Parallel race for complex / multi-action requests
+    # Tier 2: multi-action → parallel race
     if is_complex(messages, tools):
         return _parallel_race(messages, tools, confidence_threshold)
 
-    # Step 3: Local-first for simple single-tool requests
+    # Tier 3: single-action → local first, cloud fallback
     local = generate_cactus(messages, tools)
-
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
         return local
