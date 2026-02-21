@@ -267,15 +267,23 @@ def generate_cloud(messages, tools):
 # and generalises to unseen tools automatically.
 
 _router_handle = None
+_router_unavailable = False  # set to True after first failed load — prevents retrying every call
 
 
 def _get_router():
-    """Lazily load and cache the router model."""
-    global _router_handle
+    """Lazily load and cache the router model. Returns None if unavailable."""
+    global _router_handle, _router_unavailable
+    if _router_unavailable:
+        return None
     if _router_handle is None:
-        if not os.path.exists(router_model_path):
-            return None   # graceful degradation — fall back to regex heuristic
-        _router_handle = cactus_init(router_model_path)
+        if not os.path.isfile(router_model_path):  # isfile: rejects directories
+            _router_unavailable = True
+            return None
+        handle = cactus_init(router_model_path)
+        if handle is None:
+            _router_unavailable = True  # init failed — don't retry
+            return None
+        _router_handle = handle
     return _router_handle
 
 
@@ -304,16 +312,17 @@ def llm_route(messages, tools):
     router = _get_router()
 
     if router is None:
-        # Router model not downloaded — fall back to simple heuristic
+        # Router model not available — fall back to regex heuristic
         text = messages[-1]["content"].lower()
         conjunctions = len(re.findall(r'\band\b|\balso\b|\bplus\b|\bthen\b', text))
         action_verbs = len(re.findall(
             r'\b(?:set|send|text|play|check|get|find|search|remind|create|wake|book|'
             r'translate|open|add|turn|show|call)\b', text))
         tools_needed = max(conjunctions + 1, action_verbs, 1)
+        # Confidence 0.8 > routing threshold (0.65) so simple cases stay local
         return {
             "tools_needed": tools_needed,
-            "confidence": 0.6,
+            "confidence": 0.8,
             "router_time_ms": (time.time() - start) * 1000,
             "source": "heuristic-fallback",
         }
