@@ -200,7 +200,7 @@ def _extract_calls(text, tool_map):
 
     # 1. Timer
     if "set_timer" in tool_map:
-        m = re.search(r'(?:set (?:a )?)?(?:timer|countdown)\s+(?:for\s+)?(\d+)\s+min', text, re.I)
+        m = re.search(r'(?:set (?:a )?)?(?:timer|countdown)\s+(?:for\s+)?(\d+)\s+min(?:ute)?s?', text, re.I)
         if m: calls.append({"name": "set_timer", "arguments": {"minutes": int(m.group(1))}})
 
     # 2. Alarm
@@ -210,13 +210,16 @@ def _extract_calls(text, tool_map):
             from datetime import datetime
             time_str = m.group(1).upper()
             try:
-                dt = datetime.strptime(time_str, "%I:%M %p") if ":" in time_str else datetime.strptime(time_str, "%I %p")
+                # Handle space or no space: "10AM" vs "10 AM"
+                dt = datetime.strptime(time_str.replace(" ", ""), "%I%p") if ":" not in time_str else \
+                     datetime.strptime(time_str.replace(" ", ""), "%I:%M%p")
                 calls.append({"name": "set_alarm", "arguments": {"hour": dt.hour, "minute": dt.minute}})
             except: pass
 
     # 3. Weather
     if "get_weather" in tool_map:
-        m = re.search(r"(?:weather(?: like)?|conditions)\s+(?:in|for)\s+([A-Za-z\s]+)(?:$|\?|\band\b)", text, re.I)
+        # Catch "weather in London" or "weather for London" or "conditions in London"
+        m = re.search(r"(?:weather(?: like)?|conditions|temperature)\s+(?:in|for|at)\s+([A-Za-z\s]+)(?:$|\?|\band\b)", text, re.I)
         if m: calls.append({"name": "get_weather", "arguments": {"location": clean(m.group(1))}})
 
     # 4. Music
