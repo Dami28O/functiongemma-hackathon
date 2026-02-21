@@ -211,17 +211,22 @@ def _extract_calls(text, tool_map):
 
     # ── set_timer ─────────────────────────────────────────────────────────────
     if "set_timer" in tool_map:
-        # Matches: "5-minute timer", "timer for 5 min", "set a timer for 5 minutes", etc.
+        # Single unified pattern — avoids duplicate matches when text contains both
+        # "set a timer for N minutes" and "timer for N minutes" substrings.
+        # The longest/most-specific alternative is first so it captures the full phrase.
         direct = re.compile(
-            r"(\d+)[- ]min(?:ute)? timer"
+            r"(?:set (?:a )?(?:countdown )?timer (?:for|of)|start (?:a )?timer (?:for|of))"
+            r"\s*(\d+)\s*min(?:utes?)?"
             r"|timer (?:for|of) (\d+) min(?:utes?)?"
-            r"|set (?:a )?(?:countdown )?timer (?:for|of) (\d+) min(?:utes?)?"
-            r"|start (?:a )?timer (?:for|of) (\d+) min(?:utes?)?",
+            r"|(\d+)[- ]min(?:ute)? timer",
             re.IGNORECASE,
         )
+        seen_timer = set()
         for m in direct.finditer(text):
             mins = int(next(g for g in m.groups() if g is not None))
-            calls.append({"name": "set_timer", "arguments": {"minutes": mins}})
+            if mins not in seen_timer:
+                seen_timer.add(mins)
+                calls.append({"name": "set_timer", "arguments": {"minutes": mins}})
 
     # ── play_music ────────────────────────────────────────────────────────────
     if "play_music" in tool_map:
@@ -231,7 +236,15 @@ def _extract_calls(text, tool_map):
         )
         for m in pattern.finditer(text):
             song = m.group(1).strip()
-            if song and len(song) >= 2 and not song.lower().endswith(" music"):
+            # Skip generic genre+"music" phrases (e.g. "jazz music") — the model
+            # returns just the genre ("jazz") which doesn't match our regex capture.
+            # BUT only skip when it's a single-word genre + " music", not multi-word
+            # titles like "classical music" or "lo-fi beats".
+            # Safest rule: skip ONLY "<single_word> music" — one word before " music"
+            words_before_music = song.lower().removesuffix(" music").split() if song.lower().endswith(" music") else None
+            if words_before_music is not None and len(words_before_music) == 1:
+                continue  # e.g. "jazz music" → skip, let cloud return "jazz"
+            if song and len(song) >= 2:
                 calls.append({"name": "play_music", "arguments": {"song": song}})
 
     # ── send_message ──────────────────────────────────────────────────────────
@@ -456,6 +469,20 @@ def generate_hybrid(messages, tools, confidence_threshold=0.75):
         return _parallel_race(messages, tools, confidence_threshold)
 
     # Tier 2: simple ambiguous → local first, cloud fallback
+    # Special case: if play_music is available AND user wants to play something
+    # but Tier 0 couldn't safely extract the song (e.g. "Play some jazz music" → 
+    # regex skips "jazz music" since model returns "jazz"), go straight to cloud
+    # to avoid FunctionGemma returning wrong song value with high confidence.
+    play_music_ambiguous = (
+        "play_music" in tool_map
+        and re.search(r'\bplay\b', text, re.IGNORECASE)
+        and not any(c["name"] == "play_music" for c in regex_calls)
+    )
+    if play_music_ambiguous:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fallback)"
+        return cloud
+
     local = generate_cactus(messages, tools)
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
