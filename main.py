@@ -1,10 +1,10 @@
 
 import sys
-sys.path.insert(0, "cactus/python/src")
-functiongemma_path = "cactus/weights/functiongemma-270m-it"
+sys.path.insert(0, "../cactus/python/src")
+functiongemma_path = "../cactus/weights/functiongemma-270m-it"
 
 import json, os, time
-from cactus import cactus_init, cactus_complete, cactus_destroy
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
 
@@ -20,13 +20,21 @@ def generate_cactus(messages, tools):
 
     raw_str = cactus_complete(
         model,
-        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        [{"role": "system", "content": "You are a precise tool-calling assistant. Follow these absolute rules:\n"
+                                     "1. You have access to several tools. If a tool matches the user's request, you MUST call it.\n"
+                                     "2. Extract argument values EXACTLY as they appear in the user's request.\n"
+                                     "3. DO NOT hallucinate, guess, or calculate values. If the user says '10 minutes', extract 10.\n"
+                                     "4. DO NOT make up titles or messages unless told to. Strip conversational filler (e.g. use 'meeting', not 'Reminder about the meeting').\n"
+                                     "5. If a time is given like '3:00 PM', use that exact string.\n"
+                                     "6. Only use the tools provided."}] + messages,
         tools=cactus_tools,
         force_tools=True,
         max_tokens=256,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        temperature=0.0,
     )
 
+    cactus_reset(model)
     cactus_destroy(model)
 
     try:
@@ -107,6 +115,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     cloud["local_confidence"] = local["confidence"]
     cloud["total_time_ms"] += local["total_time_ms"]
     return cloud
+
 
 def print_result(label, result):
     """Pretty-print a generation result."""

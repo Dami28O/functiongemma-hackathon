@@ -1,0 +1,3 @@
+[1/30] Running: weather_sf (easy)... F1=1.00 | 339ms | on-device
+[2/30] Running: alarm_10am (easy)... F1=1.00 | 379ms | on-device
+[3/30] Running: message_alice (easy)... 
