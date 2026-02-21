@@ -131,7 +131,7 @@ def generate_cloud(messages, tools):
     start_time = time.time()
 
     gemini_response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         contents=contents,
         config=types.GenerateContentConfig(tools=gemini_tools),
     )
@@ -211,16 +211,16 @@ def _extract_calls(text, tool_map):
 
     # ── set_timer ─────────────────────────────────────────────────────────────
     if "set_timer" in tool_map:
-        pattern = re.compile(
-            r"(?:set (?:a )?(?:countdown )?timer (?:for|of)|start (?:a )?timer (?:for|of)"
-            r"|(?:a )?(\d+)[- ]minute timer)"
-            r"(?:\s+(\d+)\s*min(?:utes?)?)?",
+        # Matches: "5-minute timer", "timer for 5 min", "set a timer for 5 minutes", etc.
+        direct = re.compile(
+            r"(\d+)[- ]min(?:ute)? timer"
+            r"|timer (?:for|of) (\d+) min(?:utes?)?"
+            r"|set (?:a )?(?:countdown )?timer (?:for|of) (\d+) min(?:utes?)?"
+            r"|start (?:a )?timer (?:for|of) (\d+) min(?:utes?)?",
             re.IGNORECASE,
         )
-        # Simpler direct pattern is more reliable
-        direct = re.compile(r"(\d+)[- ]min(?:ute)? timer|timer (?:for|of) (\d+) min(?:utes?)?", re.IGNORECASE)
         for m in direct.finditer(text):
-            mins = int(m.group(1) or m.group(2))
+            mins = int(next(g for g in m.groups() if g is not None))
             calls.append({"name": "set_timer", "arguments": {"minutes": mins}})
 
     # ── play_music ────────────────────────────────────────────────────────────
@@ -268,8 +268,10 @@ def _extract_calls(text, tool_map):
             r"remind me (?:about |to )?(.+?) at (\d+:\d+\s*(?:am|pm))",
             re.IGNORECASE,
         )
+        _leading_articles = re.compile(r'^(?:the|a|an)\s+', re.IGNORECASE)
         for m in pattern.finditer(text):
-            title = m.group(1).strip().rstrip(",.")
+            title = m.group(1).strip().rstrip(",. ")
+            title = _leading_articles.sub('', title)  # strip "the meeting" → "meeting"
             time_str = m.group(2).strip().upper()
             if title and time_str:
                 calls.append({"name": "create_reminder", "arguments": {"title": title, "time": time_str}})
@@ -340,7 +342,7 @@ def _parallel_race(messages, tools, confidence_threshold):
     Fire local (Cactus) and cloud (Gemini) at the same time.
 
     Local wins only if:
-      1. Confidence >= threshold, AND
+      1. Confidence >= threshold (raised to 0.85 for 3+ action requests), AND
       2. It returned at least as many tool calls as the request implies
          (prevents partial multi-tool results like 1-of-2 tools winning)
 
@@ -348,6 +350,9 @@ def _parallel_race(messages, tools, confidence_threshold):
     """
     wall_start = time.time()
     min_calls_needed = _count_implied_actions(messages[-1]["content"])
+
+    # Harder multi-action queries need higher confidence to trust local
+    effective_threshold = 0.85 if min_calls_needed >= 3 else confidence_threshold
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     local_future = executor.submit(generate_cactus, messages, tools)
@@ -359,7 +364,7 @@ def _parallel_race(messages, tools, confidence_threshold):
     local_calls = local.get("function_calls", [])
     local_complete = len(local_calls) >= min_calls_needed
 
-    if local["confidence"] >= confidence_threshold and local_calls and local_complete:
+    if local["confidence"] >= effective_threshold and local_calls and local_complete:
         executor.shutdown(wait=False)
         local["source"] = "on-device"
         local["total_time_ms"] = elapsed_ms
@@ -380,7 +385,8 @@ def _generate_cactus_focused(messages, tools):
     """
     Focused local inference for pattern-confident (Tier 1) requests.
     Uses shorter max_tokens since we already know it's a simple call.
-    No tool_rag_top_k — that was selecting wrong tools and breaking results.
+    Uses tool_rag_top_k=1 to focus on the single most relevant tool
+    (prevents confusion when multiple similar tools are in the list).
     """
     model = _get_model()
     cactus_reset(model)
@@ -394,6 +400,7 @@ def _generate_cactus_focused(messages, tools):
         force_tools=True,
         temperature=0,
         max_tokens=128,
+        tool_rag_top_k=1,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
@@ -431,10 +438,11 @@ def generate_hybrid(messages, tools, confidence_threshold=0.75):
     # Tier 1: pattern-confident → focused local inference, skip race overhead
     if fast_path(messages, tools):
         local = _generate_cactus_focused(messages, tools)
-        if local.get("function_calls"):
+        # Trust local only if it returned calls AND confidence is acceptable
+        if local.get("function_calls") and local.get("confidence", 0) >= 0.50:
             local["source"] = "on-device"
             return local
-        # Local model unexpectedly failed — immediate cloud fallback
+        # Local model uncertain or empty — immediate cloud fallback
         cloud = generate_cloud(messages, tools)
         cloud["source"] = "cloud (fallback)"
         cloud["total_time_ms"] += local["total_time_ms"]
@@ -445,7 +453,11 @@ def generate_hybrid(messages, tools, confidence_threshold=0.75):
         return _parallel_race(messages, tools, confidence_threshold)
 
     # Tier 3: ambiguous → local first, cloud fallback
-    local = generate_cactus(messages, tools)
+    # Many-tool cases: use tool_rag_top_k=1 to help FunctionGemma focus
+    if len(tools) >= 4:
+        local = _generate_cactus_focused(messages, tools)  # uses tool_rag_top_k=1
+    else:
+        local = generate_cactus(messages, tools)
     if local["confidence"] >= confidence_threshold and local.get("function_calls"):
         local["source"] = "on-device"
         return local
