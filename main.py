@@ -43,6 +43,37 @@ _SYSTEM_PROMPT = (
 )
 
 
+def _coerce_args(function_calls, tools):
+    """
+    Coerce argument types to match the tool schema.
+    FunctionGemma often returns integers as strings (e.g. "5" instead of 5).
+    The benchmark's _normalize() does NOT convert types, so "5" != 5 → F1=0.
+    This fixes timer_5min, set_alarm, and any other integer-param tools.
+    """
+    tool_map = {t["name"]: t for t in tools}
+    for call in function_calls:
+        tool = tool_map.get(call.get("name", ""))
+        if not tool:
+            continue
+        props = tool["parameters"].get("properties", {})
+        args = call.get("arguments", {})
+        for key, val in args.items():
+            if key not in props:
+                continue
+            expected = props[key].get("type")
+            if expected == "integer" and not isinstance(val, int):
+                try:
+                    args[key] = int(float(str(val)))
+                except (ValueError, TypeError):
+                    pass
+            elif expected == "number" and not isinstance(val, float):
+                try:
+                    args[key] = float(str(val))
+                except (ValueError, TypeError):
+                    pass
+    return function_calls
+
+
 def generate_cactus(messages, tools):
     """Run function calling on-device via FunctionGemma + Cactus."""
     model = _get_model()
@@ -55,7 +86,7 @@ def generate_cactus(messages, tools):
         [{"role": "system", "content": _SYSTEM_PROMPT}] + messages,
         tools=cactus_tools,
         force_tools=True,
-        temperature=0,        # deterministic — best for structured output
+        temperature=0,
         max_tokens=256,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
@@ -65,8 +96,9 @@ def generate_cactus(messages, tools):
     except json.JSONDecodeError:
         return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
+    calls = _coerce_args(raw.get("function_calls", []), tools)
     return {
-        "function_calls": raw.get("function_calls", []),
+        "function_calls": calls,
         "total_time_ms": raw.get("total_time_ms", 0),
         "confidence": raw.get("confidence", 0),
     }
@@ -299,29 +331,34 @@ def is_complex(messages, tools):
 def _parallel_race(messages, tools, confidence_threshold):
     """
     Fire local (Cactus) and cloud (Gemini) at the same time.
-    Cactus is much faster — if it finishes with high confidence, return
-    immediately without waiting for the cloud response.
-    This gives the best of both: on-device speed when possible, cloud
-    accuracy when the local model is uncertain.
+
+    Local wins only if:
+      1. Confidence >= threshold, AND
+      2. It returned at least as many tool calls as the request implies
+         (prevents partial multi-tool results like 1-of-2 tools winning)
+
+    Wall time = actual elapsed, not sum of both.
     """
     wall_start = time.time()
+    min_calls_needed = _count_implied_actions(messages[-1]["content"])
 
-    # Submit both without a `with` block so we can return early
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     local_future = executor.submit(generate_cactus, messages, tools)
     cloud_future = executor.submit(generate_cloud, messages, tools)
 
-    # Local (Cactus) typically finishes in <300ms — check it first
     local = local_future.result()
     elapsed_ms = (time.time() - wall_start) * 1000
 
-    if local["confidence"] >= confidence_threshold and local.get("function_calls"):
-        executor.shutdown(wait=False)   # cloud keeps running but we don't wait
+    local_calls = local.get("function_calls", [])
+    local_complete = len(local_calls) >= min_calls_needed
+
+    if local["confidence"] >= confidence_threshold and local_calls and local_complete:
+        executor.shutdown(wait=False)
         local["source"] = "on-device"
         local["total_time_ms"] = elapsed_ms
         return local
 
-    # Local uncertain — wait for cloud (already running in parallel)
+    # Local uncertain or incomplete — use cloud (already running)
     cloud = cloud_future.result()
     wall_time_ms = (time.time() - wall_start) * 1000
     executor.shutdown(wait=False)
@@ -334,9 +371,9 @@ def _parallel_race(messages, tools, confidence_threshold):
 
 def _generate_cactus_focused(messages, tools):
     """
-    Like generate_cactus but with tool_rag_top_k=1 — tells FunctionGemma
-    to focus on the single most relevant tool. Faster and more accurate
-    for simple single-action requests where we already know the structure.
+    Focused local inference for pattern-confident (Tier 1) requests.
+    Uses shorter max_tokens since we already know it's a simple call.
+    No tool_rag_top_k — that was selecting wrong tools and breaking results.
     """
     model = _get_model()
     cactus_reset(model)
@@ -349,8 +386,7 @@ def _generate_cactus_focused(messages, tools):
         tools=cactus_tools,
         force_tools=True,
         temperature=0,
-        max_tokens=128,          # shorter output for simple single-tool calls
-        tool_rag_top_k=1,        # pre-filter to the most relevant tool
+        max_tokens=128,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
@@ -359,8 +395,9 @@ def _generate_cactus_focused(messages, tools):
     except json.JSONDecodeError:
         return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
+    calls = _coerce_args(raw.get("function_calls", []), tools)
     return {
-        "function_calls": raw.get("function_calls", []),
+        "function_calls": calls,
         "total_time_ms": raw.get("total_time_ms", 0),
         "confidence": raw.get("confidence", 0),
     }
