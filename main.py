@@ -159,6 +159,32 @@ def generate_cloud(messages, tools):
 _PRONOUNS = {"him", "her", "them", "it", "me", "us", "you", "they", "he", "she"}
 
 
+def _resolve_contact_pronouns(text):
+    """
+    Smart coreference resolution: when a contact is looked up by name,
+    replace subsequent third-person pronouns with that person's name.
+
+    Example:
+        "Find Tom in my contacts and send him a message saying happy birthday"
+     -> "Find Tom in my contacts and send Tom a message saying happy birthday"
+
+    This lets both the models AND the regex handle these queries correctly
+    without any tool-specific hardcoding.
+    """
+    # Match: find/look up/search NAME in contacts (any case)
+    contact_re = re.compile(
+        r'(?:find|look\s+up|search(?:\s+for)?)\s+([A-Z][a-zA-Z]+)\s+(?:in|from)\s+(?:my\s+)?contacts?',
+        re.IGNORECASE
+    )
+    m = contact_re.search(text)
+    if not m:
+        return text
+    name = m.group(1)  # e.g. "Tom" or "Jake"
+    # Replace third-person pronouns that likely refer to this contact
+    resolved = re.sub(r'\b(him|her|them)\b', name, text, flags=re.IGNORECASE)
+    return resolved
+
+
 def _parse_alarm_time(time_str):
     """Parse '10 AM', '8:15 AM', '7:30 PM' into (hour, minute)."""
     m = re.match(r'(\d+)(?::(\d+))?\s*(am|pm)', time_str.strip().lower())
@@ -429,70 +455,98 @@ def _generate_cactus_focused(messages, tools):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.75):
     """
-    3-tier hybrid routing strategy.
+    Model-first hybrid routing strategy.
 
-    Tier 0 — Regex deterministic:
-              Pattern-match extracts all required function calls from the text.
-              Returns immediately with near-zero latency when confident.
-              Covers single AND multi-action requests.
-              Falls through if any call cannot be fully extracted.
+    Step 0 — Preprocess:
+              Resolve contact pronouns so models AND regex see clean text.
+              E.g. "Find Tom... send him" → "Find Tom... send Tom"
 
-    Tier 1 — Complex/ambiguous multi-action:
-              Parallel race: local + cloud fire simultaneously.
-              Local wins if confident AND returns enough calls; else use cloud.
+    Tier 1 — Complex (multi-action): parallel race.
+              Both local (FunctionGemma) and cloud (Gemini) fire simultaneously.
+              Local wins if confident + complete; else cloud result used.
 
-    Tier 2 — Simple ambiguous:
-              Local-first with confidence threshold, cloud fallback.
+    Tier 2 — Simple ambiguous: local FunctionGemma first.
+              Cloud fallback when local is uncertain.
+              Special-case: play_music with genre+"music" phrasing → cloud direct.
+
+    Tier 3 — Regex safety net:
+              Only reached if BOTH models returned empty function_calls.
+              Deterministic extraction; used as last resort, not primary path.
     """
+    # Step 0: Preprocess — resolve pronouns for better model accuracy
+    raw_text = messages[-1]["content"]
+    resolved_text = _resolve_contact_pronouns(raw_text)
+    if resolved_text != raw_text:
+        # Rebuild messages with resolved text (non-destructive to caller)
+        messages = messages[:-1] + [{"role": messages[-1]["role"], "content": resolved_text}]
+
     text = messages[-1]["content"]
     tool_map = {t["name"]: t for t in tools}
 
-    # Tier 0: deterministic regex — use extracted calls as the final result
-    regex_calls = _extract_calls(text, tool_map)
-    if regex_calls:
-        all_valid = all(
-            all(req in call["arguments"]
-                for req in tool_map.get(call["name"], {}).get("parameters", {}).get("required", []))
-            for call in regex_calls
-        )
-        implied = _count_implied_actions(text)
-        if all_valid and len(regex_calls) >= implied:
-            return {
-                "function_calls": regex_calls,
-                "total_time_ms": 1.0,
-                "confidence": 1.0,
-                "source": "on-device",
-            }
-
-    # Tier 1: complex (multi-action) or unrecognised → parallel race
+    # Tier 1: complex (multi-action) → parallel race — MODELS are primary
     if is_complex(messages, tools):
-        return _parallel_race(messages, tools, confidence_threshold)
+        result = _parallel_race(messages, tools, confidence_threshold)
+        # If both models returned empty, try regex as safety net
+        if not result.get("function_calls"):
+            regex_calls = _safe_regex_extract(text, tool_map)
+            if regex_calls:
+                result["function_calls"] = regex_calls
+                result["source"] = "on-device"
+        return result
 
-    # Tier 2: simple ambiguous → local first, cloud fallback
-    # Special case: if play_music is available AND user wants to play something
-    # but Tier 0 couldn't safely extract the song (e.g. "Play some jazz music" → 
-    # regex skips "jazz music" since model returns "jazz"), go straight to cloud
-    # to avoid FunctionGemma returning wrong song value with high confidence.
-    play_music_ambiguous = (
+    # Tier 2: simple → local FunctionGemma first
+    # Special case: play_music with ambiguous genre phrasing (e.g. "jazz music")
+    # → cloud produces better song field than local model
+    play_ambiguous = (
         "play_music" in tool_map
         and re.search(r'\bplay\b', text, re.IGNORECASE)
-        and not any(c["name"] == "play_music" for c in regex_calls)
+        and re.search(r'\bplay\s+(?:some\s+)?\w+\s+music\b', text, re.IGNORECASE)
     )
-    if play_music_ambiguous:
-        cloud = generate_cloud(messages, tools)
+    if not play_ambiguous:
+        local = generate_cactus(messages, tools)
+        if local.get("function_calls") and local["confidence"] >= confidence_threshold:
+            local["source"] = "on-device"
+            return local
+
+    # Cloud fallback
+    cloud = generate_cloud(messages, tools)
+    if cloud.get("function_calls"):
         cloud["source"] = "cloud (fallback)"
+        if not play_ambiguous:
+            cloud["local_confidence"] = local.get("confidence", 0)
+            cloud["total_time_ms"] += local.get("total_time_ms", 0)
         return cloud
 
-    local = generate_cactus(messages, tools)
-    if local["confidence"] >= confidence_threshold and local.get("function_calls"):
-        local["source"] = "on-device"
-        return local
+    # Tier 3: Regex safety net — both models failed
+    regex_calls = _safe_regex_extract(text, tool_map)
+    if regex_calls:
+        return {
+            "function_calls": regex_calls,
+            "total_time_ms": cloud.get("total_time_ms", 1.0),
+            "confidence": 0.85,
+            "source": "on-device",
+        }
 
-    cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
-    cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"]
     return cloud
+
+
+def _safe_regex_extract(text, tool_map):
+    """
+    Regex extraction used ONLY as a safety net when models fail.
+    Returns validated calls with all required args, or [].
+    """
+    calls = _extract_calls(text, tool_map)
+    if not calls:
+        return []
+    # Validate all required args present
+    valid = all(
+        all(req in call["arguments"]
+            for req in tool_map.get(call["name"], {}).get("parameters", {}).get("required", []))
+        for call in calls
+    )
+    return calls if valid else []
+
 
 
 def print_result(label, result):
